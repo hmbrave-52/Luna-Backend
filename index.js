@@ -1,123 +1,98 @@
-const express = require('express');
-const cors = require('cors');
-const rateLimit = require('express-rate-limit');
+import express from 'express';
+import { search } from 'duck-duck-scrape';
+import OpenAI from 'openai';
+import JSZip from 'jszip';
 
 const app = express();
-const PORT = process.env.PORT || 8080;
+app.use(express.json());
 
 // ==========================================
-// 1. SECURITY & CORS SETUP
+// LITEROUTER CONFIGURATION
 // ==========================================
-app.use(cors({ origin: ['*'] }));
-
-const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 30,
-  message: { error: 'Too many requests from Luna, please slow down.' }
+const liteRouter = new OpenAI({
+  // Render injects your secret key automatically
+  apiKey: process.env.LITEROUTER_API_KEY, 
+  baseURL: "https://api.literouter.com/v1" 
 });
-app.use('/api/', limiter);
 
+const AI_MODEL = "glm-5.3-flash:free"; 
 // ==========================================
-// 2. IN-MEMORY CACHE
-// ==========================================
-const cache = new Map();
 
-// ==========================================
-// 3. OFFICIAL DDG INSTANT ANSWER FETCHER
-// ==========================================
-async function fetchSearchResults(query) {
-  // Official DDG API - Sanctioned, free, no key needed, never blocked
-  const url = `https://api.duckduckgo.com/?q=${encodeURIComponent(query)}&format=json&no_html=1&skip_disambig=1`;
-  
-  const response = await fetch(url, { 
-    headers: { 'Accept': 'application/json' },
-    signal: AbortSignal.timeout(5000) // 5s timeout just in case
-  });
+// In-memory storage for tasks (No Redis needed)
+const tasks = {};
 
-  if (!response.ok) throw new Error(`DDG API returned status ${response.status}`);
-  
-  const data = await response.json();
-  const results = [];
+// 1. Endpoint to START the task
+app.post('/api/generate', async (req, res) => {
+  const { prompt } = req.body;
+  if (!prompt) return res.status(400).json({ error: "Prompt is required" });
 
-  // 1. Direct Abstract (Usually Wikipedia summary)
-  if (data.AbstractText && data.AbstractURL) {
-    results.push({
-      title: data.Heading || query,
-      url: data.AbstractURL,
-      content: data.AbstractText
+  const taskId = crypto.randomUUID();
+  tasks[taskId] = { status: 'processing', zipBase64: null, error: null };
+
+  // Reply immediately so Luna doesn't freeze
+  res.json({ success: true, taskId });
+
+  // Run the heavy AI work in the background
+  processTask(taskId, prompt).catch(err => console.error(`Task ${taskId} failed:`, err));
+});
+
+// 2. Endpoint to CHECK the task status
+app.get('/api/status/:taskId', (req, res) => {
+  const task = tasks[req.params.taskId];
+  if (!task) return res.status(404).json({ error: 'Task not found' });
+  res.json(task);
+});
+
+// Background processing function
+async function processTask(taskId, userPrompt) {
+  try {
+    console.log(`[${taskId}] Starting DuckDuckGo Search...`);
+    const searchResults = await search(userPrompt + " html css js code example");
+    const context = searchResults.results ? searchResults.results.slice(0, 2).map(r => r.description).join("\n") : "";
+
+    console.log(`[${taskId}] Asking LiteRouter (${AI_MODEL}) for code...`);
+    
+    const completion = await liteRouter.chat.completions.create({
+      model: AI_MODEL,
+      messages: [
+        { 
+          role: "system", 
+          content: "You are an expert web developer. Return ONLY valid JSON with exactly three keys: 'index.html', 'style.css', and 'script.js'. Do NOT include markdown formatting like ```json. Just raw JSON." 
+        },
+        { 
+          role: "user", 
+          content: `Context from web search: ${context}\n\nUser Request: ${userPrompt}` 
+        }
+      ]
     });
-  }
 
-  // 2. Related Topics (Additional context & links)
-  if (Array.isArray(data.RelatedTopics)) {
-    for (const topic of data.RelatedTopics) {
-      // Skip nested topic groups, only take direct results
-      if (topic.Text && topic.FirstURL && results.length < 8) {
-        results.push({
-          title: topic.Text.split(' - ')[0] || topic.Text.substring(0, 60),
-          url: topic.FirstURL,
-          content: topic.Text
-        });
-      }
+    let rawContent = completion.choices[0].message.content.trim();
+    
+    // Smart Parser: Clean up markdown if the AI ignored the prompt
+    rawContent = rawContent.replace(/^```json\s*/i, '')
+                           .replace(/^```\s*/i, '')
+                           .replace(/\s*```$/i, '');
+
+    const generatedFiles = JSON.parse(rawContent);
+
+    console.log(`[${taskId}] Creating ZIP file...`);
+    const zip = new JSZip();
+    
+    for (const [fileName, fileContent] of Object.entries(generatedFiles)) {
+      zip.file(fileName, fileContent);
     }
-  }
+    
+    const zipBase64 = await zip.generateAsync({ type: "base64" });
+    tasks[taskId] = { status: 'completed', zipBase64: zipBase64, error: null };
+    console.log(`[${taskId}] Finished successfully!`);
 
-  // 3. Fallback: Definition (Dictionary/Technical terms)
-  if (results.length === 0 && data.Definition) {
-    results.push({
-      title: data.DefinitionSource || query,
-      url: data.DefinitionURL || '',
-      content: data.Definition
-    });
+  } catch (error) {
+    console.error(`[${taskId}] Error:`, error.message);
+    tasks[taskId] = { status: 'failed', zipBase64: null, error: error.message };
   }
-
-  if (results.length === 0) {
-    throw new Error('No instant answer found for this specific query.');
-  }
-
-  return results;
 }
 
-// ==========================================
-// 4. API ENDPOINTS
-// ==========================================
-app.get('/', (req, res) => {
-  res.send('🚀 Luna Search API is running! Use endpoint: /api/search?q=your_query');
-});
-
-app.get('/health', (req, res) => res.status(200).send('OK'));
-
-app.get('/api/search', async (req, res) => {
-  const query = req.query.q;
-
-  if (!query) return res.status(400).json({ error: 'Missing ?q= parameter' });
-  if (cache.has(query)) return res.json(cache.get(query));
-
-  try {
-    const rawResults = await fetchSearchResults(query);
-
-    const formattedResponse = {
-      query,
-      results: rawResults.map(item => ({
-        title: item.title,
-        url: item.url,
-        snippet: item.content
-      }))
-    };
-
-    cache.set(query, formattedResponse);
-    setTimeout(() => cache.delete(query), 10 * 60 * 1000);
-
-    res.json(formattedResponse);
-  } catch (error) {
-    console.error('Search failed:', error.message);
-    res.status(500).json({ error: error.message });
-  }
-});
-
-// ==========================================
-// 5. START SERVER
-// ==========================================
+const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`🔍 Luna Search API running on port ${PORT}`);
+  console.log(`Server running on port ${PORT}. Model: ${AI_MODEL}`);
 });
