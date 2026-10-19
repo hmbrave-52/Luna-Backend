@@ -1,14 +1,14 @@
 {
-  "name": "luna-search-api",
+  "name": "luna-no-redis",
   "version": "1.0.0",
-  "description": "Ultimate free DDG Instant Answer API for Luna",
-  "main": "index.js",
+  "type": "module",
   "scripts": {
-    "start": "node index.js"
+    "start": "node server.js"
   },
   "dependencies": {
-    "cors": "^2.8.5",
+    "duck-duck-scrape": "^2.2.5",
     "express": "^4.19.2",
-    "express-rate-limit": "^7.3.1"
+    "jszip": "^3.10.1",
+    "openai": "^4.56.0"
   }
 }
