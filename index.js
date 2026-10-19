@@ -1,90 +1,96 @@
 const express = require('express');
 const cors = require('cors');
 const rateLimit = require('express-rate-limit');
-const { search, SafeSearchType } = require('duck-duck-scrape');
 
 const app = express();
 const PORT = process.env.PORT || 8080;
 
-// ==========================================
-// 1. SECURITY & CORS SETUP
-// ==========================================
-
-// Allow Luna to talk to this server
-// CHANGE 'https://your-luna-app.com' TO YOUR ACTUAL LUNA URL
+// 1. CORS & Rate Limiting
 app.use(cors({
-  origin: ['https://your-luna-app.com', 'http://localhost:3000', 'http://localhost:5173'] 
+  origin: ['*'] // Change '*' to your Luna URL in production
 }));
 
-// Prevent people from spamming your API (Max 30 requests per minute per IP)
-const limiter = rateLimit({
-  windowMs: 60 * 1000,
-  max: 30,
-  message: { error: 'Too many requests, please slow down.' }
-});
+const limiter = rateLimit({ windowMs: 60 * 1000, max: 30 });
 app.use('/api/', limiter);
 
-
-// ==========================================
-// 2. IN-MEMORY CACHE (Saves repeated searches)
-// ==========================================
+// 2. Cache
 const cache = new Map();
 
+// 3. List of free public SearXNG instances (Fallbacks)
+const SEARX_INSTANCES = [
+  'https://search.sapti.me',
+  'https://searx.be',
+  'https://search.ononoki.org',
+  'https://searx.tiekoetter.com'
+];
 
-// ==========================================
-// 3. THE SEARCH ENDPOINT
-// ==========================================
+// Helper function to try searching across instances
+async function fetchSearchResults(query) {
+  for (const instance of SEARX_INSTANCES) {
+    try {
+      const url = `${instance}/search?q=${encodeURIComponent(query)}&format=json`;
+      
+      // Fetch with a 5-second timeout
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 5000);
+      
+      const response = await fetch(url, { signal: controller.signal });
+      clearTimeout(timeout);
+
+      if (!response.ok) continue; // Try next instance if this one fails
+
+      const data = await response.json();
+      return data.results || []; // Return results if successful
+      
+    } catch (err) {
+      console.warn(`Instance ${instance} failed, trying next...`);
+      continue; // Move to the next instance
+    }
+  }
+  throw new Error('All search instances failed. Try again later.');
+}
+
+// 4. The Search Endpoint
+app.get('/', (req, res) => {
+  res.send('🚀 Luna Search API is running! Use /api/search?q=your_query');
+});
+
 app.get('/api/search', async (req, res) => {
   const query = req.query.q;
 
-  // If Luna didn't send a query
   if (!query) {
     return res.status(400).json({ error: 'Missing ?q= parameter' });
   }
 
-  // If we already searched this recently, return cached result instantly
   if (cache.has(query)) {
     return res.json(cache.get(query));
   }
 
   try {
-    // Perform the web search (Free, no API key needed)
-    const rawResults = await search(query, { 
-      safeSearch: SafeSearchType.MODERATE 
-    });
+    // Use our new robust fetcher
+    const rawResults = await fetchSearchResults(query);
 
-    // Format the data nicely for Luna
     const formattedResponse = {
       query: query,
-      results: rawResults.results.slice(0, 8).map(item => ({
-        title: item.title,
-        url: item.url,
-        snippet: item.description
+      results: rawResults.slice(0, 8).map(item => ({
+        title: item.title || '',
+        url: item.url || '',
+        snippet: item.content || ''
       }))
     };
 
-    // Save to cache for 10 minutes
+    // Cache for 10 minutes
     cache.set(query, formattedResponse);
     setTimeout(() => cache.delete(query), 10 * 60 * 1000);
 
-    // Send answer back to Luna
     res.json(formattedResponse);
 
   } catch (error) {
     console.error('Search failed:', error);
-    res.status(500).json({ error: 'Search engine failed. Try again later.' });
+    res.status(500).json({ error: error.message });
   }
 });
 
-// Health check endpoint (Good for keeping Render awake)
-app.get('/health', (req, res) => {
-  res.status(200).send('Luna Search API is alive!');
-});
-
-
-// ==========================================
-// 4. START SERVER
-// ==========================================
 app.listen(PORT, () => {
   console.log(`🔍 Luna Search API running on port ${PORT}`);
 });
